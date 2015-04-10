@@ -1,5 +1,5 @@
 # cgroupsd
-This is a Perl program that monitors per user CPU usage via cgroups, then sets a CPU quota up also via cgroups. Thresholds, quotas, etc are configurable in the code.
+This is a Perl program that monitors per user CPU usage via cgroups, then when a specified usage threshod is crossed, sets a CPU quota until CPU usage is reduced.
 
 
           Usage: ./cgroupsd [-dfms]
