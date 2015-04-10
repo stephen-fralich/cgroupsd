@@ -1,0 +1,3 @@
+#!/bin/sh
+rmdir /cgroups/cgroupsd/$1
+kill -USR1 `pidof -x cgroupsd`
