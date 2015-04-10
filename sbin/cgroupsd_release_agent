@@ -1,3 +1,4 @@
 #!/bin/sh
+# Default location is /usr/local/cgroupsd/sbin
 rmdir /cgroups/cgroupsd/$1
 kill -USR1 `pidof -x cgroupsd`
