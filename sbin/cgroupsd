@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-
+# Default location is /usr/local/cgroupsd/sbin
 #use Math::BigInt lib => 'GMP';
 use Data::Dumper;
 use Getopt::Std;
