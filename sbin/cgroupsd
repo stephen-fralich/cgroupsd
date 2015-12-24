@@ -1,13 +1,14 @@
 #!/usr/bin/perl
-# Default location is /usr/local/cgroupsd/sbin
+
 #use Math::BigInt lib => 'GMP';
 use Data::Dumper;
 use Getopt::Std;
 use IO::Handle;
+use POSIX; 
 
-# If a cgroup is using 66% of 1 CPU for the given period, enforce a quota
-my $cpu_s_allowed = 200;
-my $cpu_s_allowed_period = 300;
+# If a cgroup is using 50% of 1 CPU for the given period, enforce a quota
+my $cpu_s_allowed_static = 200;
+my $cpu_s_allowed_period_static = 300;
 
 # Once a cgroup exceeds the above threshold for the given period, enforce a quota
 # until usage goes below the specified threshold.
@@ -46,18 +47,21 @@ my $poll_int = 30;
 #################################################################################
 #################################################################################
 
-our $VERSION = '20140805';
+our $VERSION = '20151223';
 
 my %cgroup_lastusage = ();
 my %cgroup_last_ratio = ();
 my %cgroup_last_diff = ();
 my %cgroup_watch_time = ();
+my %cgroup_watch_usage = ();
 my %cgroup_over_quota = ();
 my %cgroup_quota_recov_time = ();
 
+my $sub_poll_int = $poll_int * 4;
+
 $Getopt::Std::STANDARD_HELP_VERSION = 1;
 getopts('dfms') ||
-  &usage();
+  &usage;
 
 my $dbg = 0;
 if($opt_d) {
@@ -87,7 +91,7 @@ if($opt_s) {
 
 my $no_cores;
 if($auto_thresh) {
-  $no_cores = &get_no_cores();
+  $no_cores = &get_no_cores;
 }
 
 if($monitor_log) {
@@ -98,19 +102,25 @@ if($monitor_log) {
 
 if(! $fg) { &daemonize; }
 
-my $cpu_allowed_ratio = $cpu_s_allowed / $cpu_s_allowed_period;
+my $cpu_allowed_ratio = $cpu_s_allowed_static / $cpu_s_allowed_period_static;
 my $cpu_quota_ratio = $cfs_quota_us / $cfs_period_us;
-my $cpu_allowed_ratio_quota = $cpu_allowed_ratio * $cpu_quota_ratio;
+# In some cases an application can fall below the quota ratio
+#  and then start toggling between quota states.
+my $cpu_allowed_ratio_quota = $cpu_allowed_ratio * $cpu_quota_ratio * 0.5;
 
-$SIG{USR1}=\&clean_hashes;
+my $clean_hashes_flag = 0;
+
+$SIG{USR1}=\&catch_usr1;
 $SIG{TERM}=\&exit_signal_handler;
 $SIG{INT}=\&exit_signal_handler;
 
-while(true) {
+while(1) {
+  if($clean_hashes_flag) { &clean_hashes; }
   my %cgroups = &get_cgroups();
-  foreach my $cgroup (keys %cgroups) {
+#  print Dumper \%cgroups;
+  foreach my $cgroup (sort keys %cgroups) {
     my $cpu_time_ns = &get_cgroups_key($cgroup,'cpuacct.usage');
-    if($dbg && $fg) { print "#### DEBUG $cgroup raw cpuacct.usage = $cpu_time_ns\n"; }
+    if($dbg && $fg && $cpu_time_ns != 0) { print "#### DEBUG $cgroup raw cpuacct.usage = $cpu_time_ns\n"; }
     my $cpu_time_s = $cpu_time_ns / 1000000000;
     my $lastusage = $cgroup_lastusage{$cgroup};
     $cgroup_lastusage{$cgroup} = $cpu_time_s;
@@ -121,12 +131,37 @@ while(true) {
     $cgroup_last_ratio{$cgroup} = $current_ratio;
     $cgroup_last_diff{$cgroup} = $usage_diff;
     my $allowed;
+    my $cpu_s_allowed = $cpu_s_allowed_static;
     if(exists $cgroup_over_quota{$cgroup}) { $allowed = $cpu_allowed_ratio_quota; }
     else { $allowed = $cpu_allowed_ratio; }
     if($auto_thresh) {
-      my $auto_thresh_val = &auto_thresh();
+      my $auto_thresh_val = &auto_thresh;
       $allowed = $allowed * $auto_thresh_val;
+      $cpu_s_allowed = $cpu_s_allowed * $auto_thresh_val;
     }
+    # If a cgroup is already being watched
+    if(exists $cgroup_watch_time{$cgroup} && 
+       $cpu_time_s > $cgroup_watch_usage{$cgroup} + $cpu_s_allowed &&
+       ! exists $cgroup_over_quota{$cgroup}
+      ) {
+      my $msg = "$cgroup quota enforced";
+      if($dbg) { print "**** $msg\n"; }
+      if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; }
+      # send notice
+      if($enable_notices) { &send_notice($cgroup,$over_notice); }
+      $cgroup_over_quota{$cgroup} = undef;
+      if($dbg) {
+        my $ps_output = `ps -u $cgroup -O cgroup`;
+        my $top_output = `top -b -n 1 -u $cgroup`;
+        print $top_output;
+        print $ps_output;
+        if($monitor_log) { print MLOG $top_output; print MLOG $ps_output; }
+      }
+      if(! $monitor_only) {
+        &set_cgroups_key($cgroup,'cpu.cfs_quota_us',$cfs_quota_us);
+        &set_cgroups_key($cgroup,'cpu.cfs_period_us',$cfs_period_us);
+      }
+    } # end if a cgroup is being watched
     if($current_ratio >= $allowed) {
       if(! exists $cgroup_watch_time{$cgroup}) {
         my $msg = "$cgroup started watching";
@@ -137,47 +172,37 @@ while(true) {
           print $top_output;
           if($monitor_log) { print MLOG $top_output; }
         }
+        # When you start watching a cgroup, record when and how much cpu time has been used
         $cgroup_watch_time{$cgroup} = time;
-      } elsif(time >= $cgroup_watch_time{$cgroup} + $cpu_s_allowed_period && ! exists $cgroup_over_quota{$cgroup}) {
-        my $msg = "$cgroup quota enforced";
-        if($dbg) { print "**** $msg\n"; }
-        if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; }
-        # send notice
-        if($enable_notices) { &send_notice($cgroup,$over_notice); }
-        $cgroup_over_quota{$cgroup} = undef;
-        if($dbg) {
-          my $ps_output = `ps -u $cgroup -O cgroup`;
-          my $top_output = `top -b -n 1 -u $cgroup`;
-          print $top_output;
-          print $ps_output;
-          if($monitor_log) { print MLOG $top_output; print MLOG $ps_output; }
-        }
-        if(! $monitor_only) {
-          &set_cgroups_key($cgroup,'cpu.cfs_quota_us',$cfs_quota_us);
-          &set_cgroups_key($cgroup,'cpu.cfs_period_us',$cfs_period_us);
-        }
-      } elsif(exists $cgroup_over_quota{$cgroup} && exists $cgroup_quota_recov_time{$cgroup}) {
+        $cgroup_watch_usage{$cgroup} = $cpu_time_s;
+      }
+      if(exists $cgroup_over_quota{$cgroup} && exists $cgroup_quota_recov_time{$cgroup}) {
         my $msg = "$cgroup over quota again, recovery removed";
         if($dbg) { print "**** DEBUG $msg\n"; if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; } }
         delete $cgroup_quota_recov_time{$cgroup};
       }
     } else { # if not over usage threshold
+      # If a cgroup is not recovering and is being watched
       if(! exists $cgroup_quota_recov_time{$cgroup} && exists $cgroup_watch_time{$cgroup}) {
         if(exists $cgroup_over_quota{$cgroup}) {
           my $msg = "$cgroup started recovery";
           if($dbg) { print "**** DEBUG $msg\n"; if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; } }
           $cgroup_quota_recov_time{$cgroup} = time;
         } else {
-          my $msg = "$cgroup stopped watching";
-          if($dbg) { print "**** DEBUG $msg\n"; if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; } }
-          delete $cgroup_watch_time{$cgroup};
+          if(time > $cgroup_watch_time{$cgroup} + $cpu_s_allowed_period_static) {
+            my $msg = "$cgroup stopped watching";
+            if($dbg) { print "**** DEBUG $msg\n"; if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; } }
+            delete $cgroup_watch_time{$cgroup};
+            delete $cgroup_watch_usage{$cgroup};
+          }
         }
-      }
+      } 
       if(exists $cgroup_over_quota{$cgroup} && time >= $cgroup_quota_recov_time{$cgroup} + $cpu_quota_wait) {
         my $msg = "$cgroup quota removed";
         if($dbg) { print "**** $msg\n"; }
         if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; }
         delete $cgroup_watch_time{$cgroup};
+        delete $cgroup_watch_usage{$cgroup};
         delete $cgroup_quota_recov_time{$cgroup};
         delete $cgroup_over_quota{$cgroup};
         if(! $monitor_only) {
@@ -187,30 +212,44 @@ while(true) {
         if($enable_notices) { &send_notice($cgroup,$recov_notice); }
       }
     }
-    if($dbg && $fg) {
-      printf("cgroup=%s, cpu s used=%.4f, usage ratio=%.4f, usage allowed=%.4f\n",$cgroup,$usage_diff,$current_ratio,$allowed);
+    if($dbg && $fg && $usage_diff != 0) {
+      printf("cgroup=%s, cpu s used=%.4f, usage ratio=%.4f, usage ratio allowed=%.4f\n",$cgroup,$usage_diff,$current_ratio,$allowed);
+    }
+    if(exists $cgroup_watch_time{$cgroup} && ! exists $cgroup_over_quota{$cgroup}) {
+      my $cgroup_used_raw = $cpu_time_s - $cgroup_watch_usage{$cgroup};
+      my $cgroup_used = sprintf("%.1f", $cgroup_used_raw);
+      my $cpu_s_allowed_fmt = sprintf("%.1f", $cpu_s_allowed);
+      my $msg = "$cgroup has used $cgroup_used cpu s of $cpu_s_allowed_fmt cpu s allowed";
+      if($dbg) { print "**** $msg\n"; }
+      if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; }
     }
   }
   if($dbg && $fg) {
-    print "%cgroup_watch_time\n";
-    print Dumper \%cgroup_watch_time;
-    print "%cgroup_over_quota\n";
-    print Dumper \%cgroup_over_quota;
-    print "%cgroup_quota_recov_time\n";
-    print Dumper \%cgroup_quota_recov_time;
     print "%cgroup_lastusage\n";
     print Dumper \%cgroup_lastusage;
     print "%cgroup_last_ratio\n";
     print Dumper \%cgroup_last_ratio;
     print "%cgroup_last_diff\n";
     print Dumper \%cgroup_last_diff;
+    print "%cgroup_watch_time\n";
+    print Dumper \%cgroup_watch_time;
+    print "%cgroup_watch_usage\n";
+    print Dumper \%cgroup_watch_usage;
+    print "%cgroup_over_quota\n";
+    print Dumper \%cgroup_over_quota;
+    print "%cgroup_quota_recov_time\n";
+    print Dumper \%cgroup_quota_recov_time;
   }
-  sleep $poll_int;
+  my $msg = localtime(time)." sleeping $poll_int";
+  if($dbg) { print "**** $msg\n"; }
+  for(my $t = 0; $t < $sub_poll_int; $t++) {
+    select(undef, undef, undef, 0.25);
+  }
 }
 
 #######################################################
 
-sub auto_thresh() {
+sub auto_thresh {
   my $cgroups_over = 0;
   my $total_cpu_s = 0;
   my $return_ratio = 1;
@@ -227,7 +266,7 @@ sub auto_thresh() {
   return $return_ratio;
 }
 
-sub exit_signal_handler() {
+sub exit_signal_handler {
   foreach my $cgroup (keys %cgroup_over_quota) {
     if(! $monitor_only) {
       &set_cgroups_key($cgroup,'cpu.cfs_quota_us',-1);
@@ -238,25 +277,33 @@ sub exit_signal_handler() {
 }
 
 
-sub clean_hashes() {
-  my $msg = "received SIGUSR1, cleaning hashes";
-  if($dbg) { print "**** DEBUG $msg\n"; if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; } }
-  my %cgroups = &get_cgroups();
+sub clean_hashes {
+#  my $msg = "received SIGUSR1, cleaning hashes";
+#  if($dbg) { print "**** DEBUG $msg\n"; if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; } }
+  my %cgroups = &get_cgroups;
   foreach my $cgroup (keys %cgroup_lastusage) {
     if(! exists $cgroups{$cgroup}) {
       my $msg = "$cgroup hashed cleared";
       if($dbg) { print "**** DEBUG $msg\n"; if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; } }
       delete $cgroup_lastusage{$cgroup};
       delete $cgroup_watch_time{$cgroup};
+      delete $cgroup_watch_usage{$cgroup};
       delete $cgroup_quota_recov_time{$cgroup};
       delete $cgroup_over_quota{$cgroup};
       delete $cgroup_last_diff{$cgroup};
       delete $cgroup_last_ratio{$cgroup};
     }
   }
+  $clean_hashes_flag = 0;
 }
 
-sub get_cgroups() {
+sub catch_usr1 {
+  $clean_hashes_flag = 1;
+  return 1;
+}
+  
+
+sub get_cgroups {
   my %cgroups = ();
   opendir(CGROUPSD, $cgroupsd_hierarchy) ||
     die "can't open cgroupsd directory $cgroupsd_hierarchy: $!\n";
@@ -273,27 +320,27 @@ sub get_cgroups() {
   return %cgroups;
 }
 
-sub set_cgroups_key($$$) {
+sub set_cgroups_key {
   my ($cgroups_path,$cgroups_key,$cgroups_val) = @_;
   my $cgroups_file = $cgroupsd_hierarchy.'/'.$cgroups_path.'/'.$cgroups_key;
   open(CGROUPSKEY, '>', $cgroups_file) ||
-    die "can't open $cgroups_file for writing: $!";
+    warn "can't open $cgroups_file for writing: $!";
   print CGROUPSKEY $cgroups_val;
   close(CGROUPSKEY);
 }
 
-sub get_cgroups_key($$) {
+sub get_cgroups_key {
   my ($cgroups_path,$cgroups_key) = @_;
   my $cgroups_file = $cgroupsd_hierarchy.'/'.$cgroups_path.'/'.$cgroups_key;
   open(CGROUPSKEY, $cgroups_file) ||
-    warn "can't open $cgroups_file for reading: $!";
+    return 0;
   my $cgroups_val = <CGROUPSKEY>;
   chomp $cgroups_val;
   close(CGROUPSKEY);
   return $cgroups_val;
 }
 
-sub get_no_cores() {
+sub get_no_cores {
   my $no_cores;
   my $cpuinfo = '/proc/cpuinfo';
   if(-r $cpuinfo) {
@@ -308,7 +355,7 @@ sub get_no_cores() {
   return $no_cores;
 }
 
-sub send_notice($$) {
+sub send_notice {
   my($username,$notice) = @_;
   opendir(PTSDIR, $pts_path) ||
     return undef;
@@ -330,22 +377,22 @@ sub send_notice($$) {
   closedir(PTSDIR);
 }
 
-sub daemonize() {
+sub daemonize {
     chdir '/'                 or die "Can't chdir to /: $!";
     open STDIN, '/dev/null'   or die "Can't read /dev/null: $!";
     open STDOUT, '>>/dev/null' or die "Can't write to /dev/null: $!";
     open STDERR, '>>/dev/null' or die "Can't write to /dev/null: $!";
     defined(my $pid = fork)   or die "Can't fork: $!";
     exit if $pid;
-    setsid                    or die "Can't start a new session: $!";
+    my $sid = POSIX::setsid()                    or die "Can't start a new session: $!";
     umask 0;
 }
 
-sub HELP_MESSAGE() {
-  &usage();
+sub HELP_MESSAGE {
+  &usage;
 }
 
-sub usage() {
+sub usage {
   print "Usage: $0 [-dfms]\n";
   print "          -d enable debugging output\n";
   print "          -f run in the foreground\n";
