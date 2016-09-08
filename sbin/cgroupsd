@@ -148,7 +148,7 @@ while(1) {
       if($dbg) { print "**** $msg\n"; }
       if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; }
       # send notice
-      if($enable_notices) { &send_notice($cgroup,$over_notice); }
+#      if($enable_notices) { &send_notice($cgroup,$over_notice); }
       $cgroup_over_quota{$cgroup} = undef;
       if($dbg) {
         my $ps_output = `ps -u $cgroup -O cgroup`;
@@ -222,6 +222,11 @@ while(1) {
       my $msg = "$cgroup has used $cgroup_used cpu s of $cpu_s_allowed_fmt cpu s allowed";
       if($dbg) { print "**** $msg\n"; }
       if($monitor_log) { print MLOG localtime(time)." ".$msg."\n"; }
+    }
+  }
+  if($enable_notices) {
+    foreach my $cgroup (keys %cgroup_over_quota) {
+      &send_notice($cgroup,$over_notice);
     }
   }
   if($dbg && $fg) {
